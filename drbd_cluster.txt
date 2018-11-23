@@ -1,0 +1,650 @@
+ 
+
+Jensd's I/O buffer
+random technotes…
+Jensd's I/O buffer
+Search
+Main menu
+Skip to primary content
+
+    Home
+    About me
+
+Post navigation
+← Previous Next →
+Use DRBD in a cluster with Corosync and Pacemaker on CentOS 7
+Posted on 21/11/2014	
+
+When configuring a cluster, you want tot keep managing the server as simple as possible. Theoretically, the results given by any node in the cluster should be equal as you want the cluster to be transparent to the end-user. Part of doing this, is having the same data available on every node of the cluster when it’s active. One way to do this, is using a central file-share, for example over NFS but this also has disadvantages. Another way is to have a distributed file system that stays on the nodes itself. DRBD is one of them. This post explains how to integrate DRBD in a cluster with Corosync and Pacemaker.
+
+DRBD stands for Distributed Replicated Block Device and the name already explains what it is. DRBD presents a layer on top of a normal block device and is responsible for keeping it synchronized over multiple nodes. Simplified, you can compare DRBD with a RAID1-array over multiple devices in different nodes instead of over multiple devices on the same node.
+
+In this post, I will continue with the setup which was created earlier in Building a high-available failover cluster with Pacemaker, Corosync & PCS. So if you’re looking for the basic configuration of a cluster, have a look here. I assume, for this post, that you got a working cluster with Corosync and Pacemaker.
+
+The goal of these actions is to have the data for the Apache webserver synchronized over both nodes. In the example, the configured webserver was presenting the local data which we even used to identify the nodes.
+
+Since RHEL 7, Red Hat doesn’t officially support DRBD anymore. Support for DRBD is still available via an external partner. This also means that CentOS, one of the RHEL derivatives doesn’t have the DRBD packages available. Fortunately, ELRepo still provides what we need to get going with DRBD.
+Installing DRBD
+
+More info about ELRepo can be found here: http://elrepo.org/tiki/drbd83-utils.
+
+The first step in adding DRBD to the existing cluster is to configure the nodes to use the ELRepo-repository:
+
+	
+[jensd@node01 ~]$ sudo rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
+[jensd@node01 ~]$ sudo yum install http://www.elrepo.org/elrepo-release-7.0-2.el7.elrepo.noarch.rpm
+...
+Complete !
+
+
+	
+[jensd@node02 ~]$ sudo rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
+[jensd@node02 ~]$ sudo yum install http://www.elrepo.org/elrepo-release-7.0-2.el7.elrepo.noarch.rpm
+...
+Complete !
+
+After adding the repository, we can install drbd as before:
+
+[jensd@node01 ~]$ sudo yum install drbd84-utils kmod-drbd84
+...
+Complete !
+
+	
+[jensd@node02 ~]$ sudo yum install drbd84-utils kmod-drbd84
+...
+Complete !
+
+Create a (logical) volume for DRBD
+
+DRBD provides a way to distribute a block device over multiple nodes. In order to do so, we need a block device to distribute (sound logical, doesn’t it). The block device can be any available device, it doesn’t need to be a logical volume but can be a pure physical partition too. For this post, I’ll add a new logical volume on both nodes to use as my distributed block device. The size of the devices needs to be equal on all nodes.
+
+First I’ll check if I still have some free space in my volume group to create the logical volume:
+
+	
+[jensd@node01 ~]$ sudo vgdisplay vg_drbd|grep Free
+Free PE / Size 255 / 1020.00 MiB
+
+
+	
+[jensd@node02 ~]$ sudo vgdisplay vg_drbd|grep Free
+Free PE / Size 255 / 1020.00 MiB
+
+After checking what is available, I’ll create a new logical volume, named lv_drdb0 in that volume group:
+
+	
+[jensd@node01 ~]$ sudo lvcreate -n lv_drbd0 -l +100%FREE vg_drbd
+Logical volume "lv_drbd0" created
+
+	
+[jensd@node02 ~]$ sudo lvcreate -n lv_drbd0 -l +100%FREE vg_drbd
+Logical volume "lv_drbd0" created
+
+After these steps, both nodes contain a logical volume called lv_drbd0 that are equal in size (1GB).
+Configuring DRBD for Single-primary mode
+
+Now that we have a block device to share, we’ll configure DRBD to do so. Our DRBD setup will be in single-primary mode. This means that only one of the nodes can be the primary. This means that the data is only manipulated from one point at a time. For other configurations, you will need non-standard file systems. The goal of my setup is to use a standard file system like EXT3, EXT4 or XFS.
+
+Before we will start configure DRBD, we’ll have to open two TCP-ports on our firewall in order for the nodes to communicate with eachother. DRBD uses, by default, port 7788 and 7799.
+
+	
+[jensd@node01 ~]$ sudo iptables -I INPUT -p tcp -m state --state NEW -m tcp --dport 7788 -j ACCEPT
+[jensd@node01 ~]$ sudo iptables -I INPUT -p tcp -m state --state NEW -m tcp --dport 7799 -j ACCEPT
+[jensd@node01 ~]$ sudo service iptables save
+
+
+	
+[jensd@node02 ~]$ sudo iptables -I INPUT -p tcp -m state --state NEW -m tcp --dport 7788 -j ACCEPT
+[jensd@node02 ~]$ sudo iptables -I INPUT -p tcp -m state --state NEW -m tcp --dport 7799 -j ACCEPT
+[jensd@node01 ~]$ sudo service iptables save
+
+The next step is to create the DRBD configuration files. These files need to be completely equal on all nodes in the cluster.
+
+File /etc/drbd.d/global_common.conf (on node01 and node02):
+	
+global {
+        usage-count yes;
+}
+common {
+        net {
+                protocol C;
+        }
+}
+
+File /etc/drbd.d/drbd0.res (on node01 and node02):
+	
+resource drbd0 {
+        disk /dev/vg_drbd/lv_drbd0;
+        device /dev/drbd0;
+        meta-disk internal;
+        on node01 {
+                address 192.168.202.101:7789;
+        }
+        on node02 {
+                address 192.168.202.102:7789;
+        }
+}
+
+Now that we have the configuration in place, it’s time to initialize our data:
+	
+[jensd@node01 ~]$ sudo drbdadm create-md drbd0
+initializing activity log
+NOT initializing bitmap
+Writing meta data...
+New drbd meta data block successfully created.
+success
+
+At this point, we’re ready to start DRBD on both nodes and bring the drbd0 resource up. After bringing the resource up, let’s check the status:
+	
+[jensd@node01 ~]$ sudo drbdadm up drbd0
+[jensd@node01 ~]$ cat /proc/drbd
+version: 8.4.5 (api:1/proto:86-101)
+GIT-hash: 1d360bde0e095d495786eaeb2a1ac76888e4db96 build by mockbuild@, 2014-08-17 22:54:26
+ 0: cs:WFConnection ro:Secondary/Unknown ds:Inconsistent/DUnknown C r----s
+	ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:1048508
+	
+[jensd@node02 ~]$ sudo drbdadm up drbd0
+[jensd@node02 ~]$ cat /proc/drbd
+version: 8.4.5 (api:1/proto:86-101)
+GIT-hash: 1d360bde0e095d495786eaeb2a1ac76888e4db96 build by mockbuild@, 2014-08-17 22:54:26
+ 0: cs:Connected ro:Secondary/Secondary ds:Inconsistent/Inconsistent C r-----
+	ns:0 nr:0 dw:0 dr:0 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:1048508
+
+As you can see in the contents of /proc/drbd, DRBD marks this resource as inconsistent. This is because we didn’t tell DRBD who is the primary node. In the above output you can see that both nodes are thinging that they are the secondary node. All configuration files are identical on both nodes so at this point, they’re considered equal.
+
+Let’s configure node01 as the primary and check the status again:
+	
+[jensd@node01 ~]$ sudo drbdadm primary --force drbd0
+[jensd@node01 ~]$ cat /proc/drbd
+version: 8.4.5 (api:1/proto:86-101)
+GIT-hash: 1d360bde0e095d495786eaeb2a1ac76888e4db96 build by mockbuild@, 2014-08-17 22:54:26
+ 0: cs:SyncSource ro:Primary/Secondary ds:UpToDate/Inconsistent C r-----
+    ns:175896 nr:0 dw:0 dr:175896 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:868516
+        [==>.................] sync'ed: 16.9% (868516/1044412)K
+        finish: 0:01:38 speed: 8,792 (8,792) K/sec
+
+As you can see in the above output now, the data is synced from node01 (which we set as the primary node) to node02 (which is now the secondary node. The volume which we used (lv_drbd0) was empty but since DRBD is not looking at the contents (blocks) it still needs to synchronize the blocks on the volume.
+
+After a while, the synchronization finished and the resource is considered UpToDate:
+	
+[jensd@node01 ~]$ cat /proc/drbd
+version: 8.4.5 (api:1/proto:86-101)
+GIT-hash: 1d360bde0e095d495786eaeb2a1ac76888e4db96 build by mockbuild@, 2014-08-17 22:54:26
+ 0: cs:Connected ro:Primary/Secondary ds:UpToDate/UpToDate C r-----
+    ns:1044412 nr:0 dw:0 dr:1044412 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:0
+
+To be sure, we can check this in another way. Here you can also clearly see who’s the primary and who’s the secondary:
+	
+[jensd@node01 ~]$ sudo drbd-overview
+ 0:drbd0/0  Connected Primary/Secondary UpToDate/UpToDate
+	
+[jensd@node02 ~]$ sudo drbd-overview
+ 0:drbd0/0  Connected Secondary/Primary UpToDate/UpToDate
+
+ Create a file system on the DRBD resource
+
+Now that the resource is synced over both nodes, we can start creating the actual file system for the block device. For DRBD, the contents of the file system isn’t important, DRBD only cares that the “blocks” are equal on both sides. This will also happen with the file system which we create:
+	
+[jensd@node01 ~]$ sudo mkfs.xfs /dev/drbd0
+meta-data=/dev/drbd0             isize=256    agcount=4, agsize=65276 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0
+data     =                       bsize=4096   blocks=261103, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0 ftype=0
+log      =internal log           bsize=4096   blocks=853, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+
+After creating a filesystem on the DRBD resource, we can start putting data on the FS:
+	
+[jensd@node01 ~]$ sudo mount /dev/drbd0 /mnt
+[jensd@node01 ~]$ sudo mkdir /mnt/test
+[jensd@node01 ~]$ sudo touch /mnt/f1
+[jensd@node01 ~]$ sudo touch /mnt/f2
+
+Test the failover
+
+To do a (clean) manual failover, we can simply switch the primary and secondary nodes and check if the data got replicated to the second node and back:
+
+	
+[jensd@node01 ~]$ mount|grep /dev/drbd0
+/dev/drbd0 on /mnt type xfs (rw,relatime,seclabel,attr2,inode64,noquota)
+[jensd@node01 ~]$ ls -al /mnt/
+total 4
+drwxr-xr-x. 3 root root 35 Nov 21 12:26 .
+dr-xr-xr-x. 17 root root 4096 Nov 21 10:05 ..
+-rw-r--r--. 1 root root 0 Nov 21 12:26 f1
+-rw-r--r--. 1 root root 0 Nov 21 12:26 f2
+drwxr-xr-x. 2 root root 6 Nov 21 12:26 test
+[jensd@node01 ~]$ sudo umount /mnt
+[jensd@node01 ~]$ sudo drbdadm secondary drbd0
+[jensd@node01 ~]$ sudo drbd-overview
+0:drbd0/0 Connected Secondary/Secondary UpToDate/UpToDate
+	
+[jensd@node02 ~]$ sudo drbdadm primary drbd0
+[jensd@node02 ~]$ sudo mount /dev/drbd0 /mnt
+[jensd@node02 ~]$ sudo mount /dev/drbd0 /mnt
+[jensd@node02 ~]$ ls -al /mnt/
+total 4
+drwxr-xr-x.  3 root root   35 Nov 21 12:26 .
+dr-xr-xr-x. 17 root root 4096 Nov 21 10:04 ..
+-rw-r--r--.  1 root root    0 Nov 21 12:26 f1
+-rw-r--r--.  1 root root    0 Nov 21 12:26 f2
+drwxr-xr-x.  2 root root    6 Nov 21 12:26 test
+[jensd@node02 ~]$ sudo drbd-overview
+ 0:drbd0/0  Connected Primary/Secondary UpToDate/UpToDate /mnt xfs 1017M 33M 985M 4%
+
+In case you try to mount the resource on a node which is considered secondary, you should a message similar to this:
+	
+[jensd@node01 ~]$ sudo mount /dev/drbd0 /mnt
+mount: /dev/drbd0 is write-protected, mounting read-only
+mount: mount /dev/drbd0 on /mnt failed: Wrong medium type
+
+Add the DRBD resource to our previously configured Pacemaker/Corosync cluster
+
+In my previous post, I created a cluster with Apache to serve webpages in a high available setup. both nodes had to have an identical set of webpages in order to server the exact same content regardless of which node was the active one. Now we’ll add the DRBD-resource to the cluster and move the data for the website to the resource.
+
+To configure DRDB on our cluster, we’ll first edit the configuration as we want it to be and then push it to the actual, running configuration. To accomplish this, we can create a new CIB (Cluster Information Base). Basically it’s a file that contains the complete cluster configuration.
+	
+[jensd@node01 ~]$ sudo pcs cluster cib add_drbd
+[jensd@node01 ~]$ ls -al add_drbd
+-rw-rw-r--. 1 jensd jensd 6968 Nov 21 12:40 add_drbd
+
+If you would look at the contents of the file, you would find the complete, currently active, configuration in there.
+
+Now, let’s add the changes to the cib-file to include our DRBD resource:
+	
+[jensd@node01 ~]$ sudo pcs -f add_drbd resource create webserver_data ocf:linbit:drbd drbd_resource=drbd0 op monitor interval=60s
+[jensd@node01 ~]$ sudo pcs -f add_drbd resource master webserver_data_sync webserver_data master-max=1 master-node-max=1 clone-max=2 clone-node-max=1 notify=true
+
+We can query the CIB as we would do with the normal active configuration:
+	
+[jensd@node01 ~]$ sudo pcs -f add_drbd resource show
+ virtual_ip (ocf::heartbeat:IPaddr2): Started
+ webserver (ocf::heartbeat:apache): Started
+ Master/Slave Set: webserver_data_sync [webserver_data]
+ Stopped: [ node01 node02 ]
+
+When the configuration is as want it to be, we can activate it by pushing it to the cluster:
+	
+[jensd@node01 ~]$ sudo pcs cluster cib-push add_drbd
+CIB updated
+
+When looking at the status of our cluster now, we see that something clearly went wrong:
+	
+[jensd@node01 ~]$ sudo pcs status
+Cluster name: cluster_web
+Last updated: Fri Nov 21 13:18:07 2014
+Last change: Fri Nov 21 13:17:55 2014 via cibadmin on node01
+Stack: corosync
+Current DC: node01 (1) - partition with quorum
+Version: 1.1.10-32.el7_0.1-368c726
+2 Nodes configured
+4 Resources configured
+ 
+Online: [ node01 node02 ]
+Full list of resources:
+ 
+ virtual_ip     (ocf::heartbeat:IPaddr2):       Started node01
+ webserver      (ocf::heartbeat:apache):        Started node01
+ Master/Slave Set: webserver_data_sync [webserver_data]
+     webserver_data     (ocf::linbit:drbd):     FAILED node01 (unmanaged)
+     webserver_data     (ocf::linbit:drbd):     FAILED node02 (unmanaged)
+ 
+Failed actions:
+    webserver_data_stop_0 on node01 'not installed' (5): call=22, status=complete, last-rc-change='Fri Nov 21 13:17:56 2014', queued=51ms, exec=0ms
+    webserver_data_stop_0 on node02 'not installed' (5): call=18, status=complete, last-rc-change='Fri Nov 21 13:17:56 2014', queued=43ms, exec=0ms
+
+After a little investigation, it seems that the permissions on file /var/lib/pacemaker/cores do not allow write from DRBD. It found this by looking at /var/log/audit/audit.log:
+	
+type=AVC msg=audit(1416572808.128:620): avc: denied { dac_read_search } for pid=27616 comm="drbdadm-84" capability=2 scontext=system_u:system_r:drbd_t:s0 tcontext=system_u:system_r:drbd_t:s0 tclass=capability
+type=SYSCALL msg=audit(1416572808.128:620): arch=c000003e syscall=2 success=no exit=-13 a0=4256d7 a1=80000 a2=666e6f632e6462 a3=7fffe11d3590 items=1 ppid=27613 pid=27616 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4294967295 comm="drbdadm-84" exe="/usr/lib/drbd/drbdadm-84" subj=system_u:system_r:drbd_t:s0 key=(null)
+type=CWD msg=audit(1416572808.128:620): cwd="/var/lib/pacemaker/cores"
+
+The message saying that dac_read_search is denied means that the user doesn’t have access to the file but tries to elevate it’s permissions to get it.
+
+We’ll change the permissions to world writable (not secure) to fix this on both nodes:
+	
+[jensd@node01 ~]$ sudo ls -al /var/lib/pacemaker/cores
+total 0
+drwxr-x---. 2 hacluster haclient 6 Sep 30 14:40 .
+drwxr-x---. 6 hacluster haclient 57 Nov 21 10:33 ..
+[jensd@node01 ~]$ sudo chmod 777 /var/lib/pacemaker/cores
+	
+[jensd@node02 ~]$ sudo chmod 777 /var/lib/pacemaker/cores
+
+After restarting the cluster, it’s still not working and now we can stil see very similar messages in the audit.log:
+	
+type=AVC msg=audit(1416573839.047:692): avc: denied { read } for pid=30198 comm="drbdadm-84" name="cores" dev="dm-2" ino=16918999 scontext=system_u:system_r:drbd_t:s0 tcontext=system_u:object_r:cluster_var_lib_t:s0 tclass=dir
+type=SYSCALL msg=audit(1416573839.047:692): arch=c000003e syscall=2 success=no exit=-13 a0=4256d7 a1=80000 a2=666e6f632e6462 a3=7fffa43960a0 items=1 ppid=30197 pid=30198 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4294967295 comm="drbdadm-84" exe="/usr/lib/drbd/drbdadm-84" subj=system_u:system_r:drbd_t:s0 key=(null)
+type=CWD msg=audit(1416573839.047:692): cwd="/var/lib/pacemaker/cores"
+
+The difference is that DRBD does have access to the file now but SELinux is trying to prevent access. To see which SELinux boolean we need to enable, if there is one to allow access:
+	
+[jensd@node01 ~]$ sudo tail -200 /var/log/audit/audit.log|grep AVC|tail -1|audit2allow -m drbd_0
+module drbd_0 1.0;
+require {
+        type cluster_var_lib_t;
+        type drbd_t;
+        class dir read;
+}
+#============= drbd_t ==============
+#!!!! This avc can be allowed using the boolean 'daemons_enable_cluster_mode'
+allow drbd_t cluster_var_lib_t:dir read;
+
+As the output of audit2allow states, we can set daemons_enable_cluster_mode to enabled on both nodes to fix this:
+	
+[jensd@node01 ~]$ sudo setsebool daemons_enable_cluster_mode=1
+	
+[jensd@node02 ~]$ sudo setsebool daemons_enable_cluster_mode=1
+
+When restarting the cluster, things should look a little better. Unfortunately, there is still a problem which doesn’t allow us to stop the cluster. Again SELinux is not allow us to take this action. Which is clear when looking at /var/log/audit/audit.log:
+	
+type=AVC msg=audit(1416575077.693:1532): avc:  denied  { sys_admin } for  pid=40528 comm="drbdsetup-84" capability=21  scontext=system_u:system_r:drbd_t:s0 tcontext=system_u:system_r:drbd_t:s0 tclass=capability
+
+We can allow this action by creating a new SELinux module and to load it:
+	
+[jensd@node01 ~]$ sudo tail -100 /var/log/audit/audit.log|grep AVC|tail -1|audit2allow -M drdb_1
+******************** IMPORTANT ***********************
+To make this policy package active, execute:
+semodule -i drdb_1.pp
+[jensd@node01 ~]$ cat drdb_1.te
+module drdb_1 1.0;
+require {
+        type drbd_t;
+        class capability sys_admin;
+}
+#============= drbd_t ==============
+allow drbd_t self:capability sys_admin;
+[jensd@node01 ~]$ sudo semodule -i drdb_1.pp
+
+We’ll copy the module to node02 and load it there too:
+	
+[jensd@node02 ~]$ scp node01:/home/jensd/drdb_1.pp ~
+jensd@node01's password:
+drdb_1.pp
+[jensd@node02 ~]$ sudo semodule -i drdb_1.pp
+
+Now we can stop and start the cluster again and the output of the status command looks better:
+	
+[jensd@node01 ~]$ sudo pcs status
+Cluster name: cluster_web
+Last updated: Fri Nov 21 14:24:28 2014
+Last change: Fri Nov 21 14:01:04 2014 via cibadmin on node01
+Stack: corosync
+Current DC: node01 (1) - partition with quorum
+Version: 1.1.10-32.el7_0.1-368c726
+2 Nodes configured
+4 Resources configured
+ 
+Online: [ node01 node02 ]
+ 
+Full list of resources:
+ virtual_ip     (ocf::heartbeat:IPaddr2):       Started node01
+ webserver      (ocf::heartbeat:apache):        Started node01
+ Master/Slave Set: webserver_data_sync [webserver_data]
+     Masters: [ node02 ]
+     Slaves: [ node01 ]
+
+The above output shows that the resource is successfully added and is started but since our master was still node02, this isn’t really how we want it. The master should be the node that is owning the virtual IP and is running the webserver.
+
+First, we’ll create a filesystem resource on the cluster, using a new cib-file:
+	
+[jensd@node01 ~]$ sudo pcs cluster cib add_fs
+[jensd@node01 ~]$ sudo pcs -f add_fs resource create webserver_fs Filesystem device="/dev/drbd0" directory="/var/www/html" fstype="xfs"
+
+Then we’ll create some constraints for the added resource:
+The filesystem of the webserver should be made available on the master:
+	
+[jensd@node01 ~]$ sudo pcs -f add_fs constraint colocation add webserver_fs webserver_data_sync INFINITY with-rsc-role=Master
+
+DRBD should first be started and then the file system should be made available:
+
+[jensd@node01 ~]$ sudo pcs -f add_fs constraint order promote webserver_data_sync then start webserver_fs
+Adding webserver_data_sync webserver_fs (kind: Mandatory) (Options: first-action=promote then-action=start)
+
+Apache and the file system should be running on the same node
+	
+[jensd@node01 ~]$ sudo pcs -f add_fs constraint colocation add webserver webserver_fs INFINITY
+
+The file system needs to be made available before Apache is started:
+	
+[jensd@node01 ~]$ sudo pcs -f add_fs constraint order webserver_fs then webserver
+Adding webserver_fs webserver (kind: Mandatory) (Options: first-action=start then-action=start)
+
+Next step is to acutally apply the changes which we made in the cib-file on the actual running configuration:
+
+[jensd@node01 ~]$ sudo pcs cluster cib-push add_fs
+CIB updated
+
+Normally, the actions should be performed immediately but I had to stop and start the cluster in order to get things working but this should be the result:
+	
+[jensd@node01 ~]$ sudo pcs status
+Cluster name: cluster_web
+Last updated: Fri Nov 21 15:05:22 2014
+Last change: Fri Nov 21 15:05:13 2014 via cibadmin on node01
+Stack: corosync
+Current DC: node01 (1) - partition with quorum
+Version: 1.1.10-32.el7_0.1-368c726
+2 Nodes configured
+5 Resources configured
+ 
+Online: [ node01 node02 ]
+ 
+Full list of resources:
+ 
+ virtual_ip     (ocf::heartbeat:IPaddr2):       Started node01
+ webserver      (ocf::heartbeat:apache):        Started node01
+ Master/Slave Set: webserver_data_sync [webserver_data]
+     Masters: [ node01 ]
+     Slaves: [ node02 ]
+ webserver_fs   (ocf::heartbeat:Filesystem):    Started node01
+
+As the output shows, the DRBD master has become node01 and all resources were started on that node. Our constraints made sure that before the webserver was started, the virtual IP was available and that the DRBD-resource was mounted and available.
+
+To be sure that the DRBD configuration went fine, we can check if our filesystem-resource did it’s work:
+	
+[jensd@node01 ~]$ mount|grep drbd0
+/dev/drbd0 on /var/www/html type xfs (rw,relatime,seclabel,attr2,inode64,noquota)
+[jensd@node01 ~]$ ls -al /var/www/html/
+total 0
+drwxr-xr-x. 3 root root 35 Nov 21 15:07 .
+drwxr-xr-x. 4 root root 31 Nov 21 10:33 ..
+-rw-r--r--. 1 root root  0 Nov 21 12:26 f1
+-rw-r--r--. 1 root root  0 Nov 21 12:26 f2
+drwxr-xr-x. 2 root root  6 Nov 21 12:26 test
+
+Finally, we can add data for our website to the mount: Let’s start with creating an index.html on our DRBD file system:
+
+[jensd@node02 ~]$ sudo vi /var/www/html/index.html
+[jensd@node02 ~]$ cat /var/www/html/index.html
+<html>
+ <h1>DRBD</h1>
+</html>
+
+When stopping node01, everything should switch to node02 including the data which we just modified on node01:
+
+[jensd@node01 ~]$ sudo pcs cluster stop
+Stopping Cluster…
+	
+[jensd@node02 ~]$ sudo pcs status
+Cluster name: cluster_web
+Last updated: Fri Nov 21 15:12:27 2014
+Last change: Fri Nov 21 15:05:13 2014 via cibadmin on node01
+Stack: corosync
+Current DC: node02 (2) - partition with quorum
+Version: 1.1.10-32.el7_0.1-368c726
+2 Nodes configured
+5 Resources configured
+ 
+Online: [ node02 ]
+OFFLINE: [ node01 ]
+ 
+Full list of resources:
+ 
+ virtual_ip     (ocf::heartbeat:IPaddr2):       Started node02
+ webserver      (ocf::heartbeat:apache):        Started node02
+ Master/Slave Set: webserver_data_sync [webserver_data]
+     Masters: [ node02 ]
+     Stopped: [ node01 ]
+ webserver_fs   (ocf::heartbeat:Filesystem):    Started node02
+
+When checking the website, we get the modified webpage:
+	
+[jensd@node02 ~]$ curl http://192.168.202.100
+<html>
+ <h1>DRBD</h1>
+</html>
+
+The above example was made for a webserver but can be used for various other services too. Unfortunately DRBD isn’t really supported as it should on RHEL or CentOS (at least not for free) so we need to perform some additional steps in order to get things working.
+This entry was posted in Apache, CentOS, High availability, Linux, Network, Red Hat, RHEL by jensd. Bookmark the permalink.
+15 thoughts on “Use DRBD in a cluster with Corosync and Pacemaker on CentOS 7”
+
+    Maik on 30/12/2014 at 10:49 said:
+
+    Hi, I followed your tutorial, but I am stucking now when initializing the data.
+
+    # sudo drbdadm create-md drbd0
+    ‘drbd0′ not defined in your config (for this host).
+
+    Any idea?
+
+    Thanks
+
+    Maik
+    Reply ↓	
+        jensd on 30/12/2014 at 10:51 said:
+
+        Maik,
+
+        Check the config in /etc/drbd.d/drbd0.res. Maybe a syntax error? My best guess is that the problem is situated there.
+
+        Let me know if that helps.
+        Reply ↓	
+            Maik on 01/01/2015 at 10:16 said:
+
+            Thanks for your reply.
+            I fixed it myself. Next time I should take more care about the hostnames at the config…..
+            I got it working exactly the way you explained, but I had to stop iptables to get the disk sync working. Maybe you made a mistake with the ports, you opened?
+            Reply ↓	
+    Piko on 07/01/2015 at 17:02 said:
+
+    Nice … all is working well, I added virtual IP and FileSystem (start file system, then VirtualIP …. and all I need is NFS configuration to have complete HA storage)
+
+    is there tutorial or something to add NFS share (to be high-avaliable) on configuration in tutorial here …. I need PCS cib for NFS, all I can find is crm_shell
+    Reply ↓	
+        jensd on 07/01/2015 at 17:05 said:
+
+        Don’t know if a CIB exists for NFS but I would think that the IP failover in combination with shared storage (with DRBD) should be enough to make your NFS-share high available. The NFS-client shouldn’t really experience problems in case of failover and the IP and data stays the same.
+        Reply ↓	
+            Piko on 07/01/2015 at 23:40 said:
+
+            I actually try to adopt https://www.howtoforge.com/high_availability_nfs_drbd_heartbeat_p3 to your HA tutorial …. To add NFS failover to another node …. I stuck at creating pcs resource for NFS server …. I try to start drbd_fs then VirtualIP than NFS share on primary node…. And on stoping primary node that all services failover on another node…. Drbd_fs and VirtualIP are automaticly started od another node, …. But I cannot figure NFS failover….
+            Reply ↓	
+                jensd on 08/01/2015 at 09:44 said:
+
+                I’ll have a look when I find some time (biggest problem at the moment) and let you know :)
+                Reply ↓	
+    John on 14/01/2015 at 18:16 said:
+
+    Fantastic Tutorial! Worked like a charm. Any chance you might have a tutorial on how to setup drbd in a primary/primary pcs cluster?
+    Reply ↓	
+    Rodommoc on 06/02/2015 at 16:22 said:
+
+    Im setting up a ESXi cluster web/file server with a shared HDD. It was working until I went to setup the DRBD. I had to restore the 2nd server from backup now I’m getting this:
+
+    [root@ATCServer01 ~]# sudo pcs status
+    Cluster name: cluster_web
+    Last updated: Fri Feb 6 09:05:47 2015
+    Last change: Fri Feb 6 06:38:20 2015 via cibadmin on ATCServer01
+    Stack: corosync
+    Current DC: ATCServer01 (1) – partition with quorum
+    Version: 1.1.10-32.el7_0.1-368c726
+    2 Nodes configured
+    4 Resources configured
+
+    Online: [ ATCServer01 ATCServer02 ]
+
+    Full list of resources:
+
+    virtual_ip (ocf::heartbeat:IPaddr2): Started ATCServer01
+    webserver (ocf::heartbeat:apache): Started ATCServer01
+    Master/Slave Set: webserver_data_sync [webserver_data]
+    webserver_data (ocf::linbit:drbd): FAILED ATCServer02 (unmanaged)
+    Masters: [ ATCServer01 ]
+
+    Failed actions:
+    webserver_data_stop_0 on ATCServer02 ‘not installed’ (5): call=18, status=complete, last-rc-change=’Fri Feb 6 09:00:55 2015′, queued=15281ms, exec=0ms
+
+    PCSD Status:
+    ATCServer01: Online
+    ATCServer02: Online
+
+    Daemon Status:
+    corosync: active/enabled
+    pacemaker: active/enabled
+    pcsd: active/enabled
+    [root@ATCServer01 ~]# sudo crm_verify -L -V
+    error: unpack_rsc_op: No further recovery can be attempted for webserver_data:1: stop action failed with ‘not installed’ (5)
+
+    I ran: sudo tail -100 /var/log/audit/audit.log|grep AVC|tail -1|audit2allow -M drdb_1
+    The reply is there is nothing to do
+
+    [root@ATCServer02 ~]# sudo ls -al /var/lib/pacemaker/cores
+    total 0
+    drwxrwxrwx. 2 hacluster haclient 6 Feb 6 08:36 .
+    drwxr-x—. 6 hacluster haclient 57 Feb 5 12:09 ..
+
+    [root@ATCServer02 ~]# sudo drbd-overview
+    0:drbd0/0 Unconfigured . .
+
+    [root@ATCServer02 ~]# sudo drbdadm up drbd0
+    –== Thank you for participating in the global usage survey ==–
+    The server’s response is:
+    node already registered
+
+    I have been working on this for 2 days and can’t figure it out. I should let you know I’m noob with Linux. any help would be much appreciated, Thank you!!
+    Reply ↓	
+    swen on 11/03/2015 at 12:53 said:
+
+    Great tutorial. Any answer for the NFS HA configuration?
+    Reply ↓	
+        Piko on 15/03/2015 at 00:51 said:
+
+        Still nothing on HA NFS. But it would be nice to add similar tutorial for creating active/active DRBD with GFS2… That configuration would be more usuable in cluster enviroment for KVM/XEN live migrations (I use KVM) … and also, better solution than Primary/Secondary solution with NFS since there is less network operations since every host access shared storage as “local” disk, not as NFS (so no need for shared IP, no need to setup NFS, less network dataflow, and performace for two-node wold be better that way). Data on disks would be qcow images accessed only form one server (no metter which one), and both host can have live KVM machines (ex. 5 KVM on node1, 5 on node2, if needed I can migrate all to one host, perform restart or upgrade on another host, afther restart live migrate all or some to restarted/upgraded host).
+
+        That way two node host would be more usuable, and not just backup copy of disk. Network bandwich is better utilised since KVM machines are on both hosts (each have network on their host) and only disk data is synchronized.
+
+        Primary/Secondary have most network on one host, and other host only get disk synchronized. If I setup NFS on that scenario all network for NFS shares goes to primary. Having KVM machines on secondary host that access that NFS disk make additional NFS network data to primary which sync that bata back to secondary. Lots of unneccecary network data back and forth…. Using GFS saves bandwich for other better uses. So I’ll rather try to setup Active/Active setup….
+
+        It would be nice that someone more expirienced than I create tutorial….
+        Reply ↓	
+            Piko on 15/03/2015 at 01:01 said:
+
+            I forgot to mention that I already tryed GlusterFS and for some time it was working fine, but I had serious loose of data after upgrade of Gluster packages on CentOS7 (could not mount Gluster disk, all blame on forums was on CentOS gluster packages and their versioning but no any usuable solution for fixing that and get running again), …
+
+            Never loost byte using DRBD so Gluster will never see me again.
+            Reply ↓	
+            jensd on 16/03/2015 at 13:31 said:
+
+            As for Active/Active, I tried this quite intensive with Corosync and Pacemaker but in a corporate environment, I always seems to struggle with the network.
+
+            Active/Active works with multicast MAC (yes, this isn’t a typo, such dinosaurs actually exist). The packages destined for the virtual IP will be forwarded to both nodes in the cluster but an iptables rule (CLUSTERIP) will filter these based on a hash of the source ip/port. The multicast MAC seems to confuse a lot of switches on ARP level. In theory enabling IGMP snooping should fix this but I never really got it working to a level where I fully trust it.
+            Reply ↓	
+    Chris on 26/03/2015 at 13:40 said:
+
+    webserver (ocf::heartbeat:apache): Stopped
+
+    Failed actions:
+    webserver_start_0 on centos01 ‘unknown error’ (1): call=22, status=Timed Out, last-rc-change=’Thu Mar 26 19:31:45 2015′, queued=40002ms, exec=0ms
+
+    can anyone help? which part I should look for solution? The apache is running fine…
+    Reply ↓	
+        jensd on 26/03/2015 at 13:43 said:
+
+        This looks like something is wrong with the status page which you configured for you webserver. Are you able to fetch the page yourself (with wget or curl) using the correct IP?
+        Reply ↓	
+
+
+
+

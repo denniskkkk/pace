@@ -1,0 +1,245 @@
+ 
+ Guest Fencing
+
+
+This HowTo applies to versions of Pacemaker >= 1.1.0
+
+
+Contents [hide]
+
+    1 Installation
+        1.1 Fedora-12 and later
+        1.2 Fedora-18 and later
+        1.3 From source
+    2 Configure the Host
+        2.1 For Guests Running on a Single Host
+        2.2 For Guests Running on Multiple Hosts
+        2.3 Testing the Host
+    3 Configure the Guest
+        3.1 Testing the Guest
+        3.2 Configure Fencing Resource in Pacemaker
+
+Installation
+
+Repeat for all hosts and the guests that will make up the cluster.
+Fedora-12 and later
+
+ yum install fence-virt fence-virtd
+
+Fedora-18 and later
+
+On Fedora 18, you need to install extra packages for the host.
+
+yum install fence-virtd-multicast fence-virtd-libvirt
+
+    Without 'fence-virtd-multicast', you will see an error like: 'No plugins found'.
+    Without 'fence-virtd-libvirtd', you will see an error like: 'Could not find backend "libvirt"'. 
+
+From source
+
+ git clone git://fence-virt.git.sourceforge.net/gitroot/fence-virt/fence-virt
+ cd fence-virt
+ ./build
+ sudo make install
+
+Configure the Host
+For Guests Running on a Single Host
+
+Run the configuration tool:
+
+ fence_virtd -c
+
+Accept all the defaults except for exceptions listed below:
+
+
+ Setting a preferred interface causes fence_virtd to listen only
+ on that interface.  Normally, it listens on all interfaces.
+ In environments where the virtual machines are using the host
+ machine as a gateway, this *must* be set (typically to virbr0).
+ Set to 'none' for no interface.
+ 
+ Interface [none]: virbr0
+
+For now, you should accept the default unless the guests are NATed. My guests do not have an address on the real network, so I need to indicate the interface the host talks to the guests on.
+
+
+ Key File [none]: /etc/cluster/fence_xvm.key
+
+This ensures only machines with the same file can initiate fencing requests
+
+
+At the end, it will ask you to
+
+ Replace /etc/fence_virt.conf with the above [y/N]? y
+
+say yes.
+
+Now populate the security key:
+
+ dd if=/dev/random bs=512 count=1 of=/etc/cluster/fence_xvm.key
+
+
+You should end up with a configuration like the one below:
+
+ backends {
+ 	libvirt {
+ 		uri = "qemu:///system";
+ 	}
+ }
+ 
+ listeners {
+ 	multicast {
+ 		key_file = "/etc/cluster/fence_xvm.key";
+ 		interface = "virbr0";
+ 		port = "1229";
+ 		address = "225.0.0.12";
+ 		family = "ipv4";
+ 	}
+ }
+ 
+ fence_virtd {
+ 	backend = "libvirt";
+ 	listener = "multicast";
+ 	module_path = "/usr/lib64/fence-virt";
+ }
+
+For Guests Running on Multiple Hosts
+
+Not yet supported, check back soon.
+
+Rough commands:
+
+ yum install -y libvirt-qpid qpidd
+ chkconfig --level 2345 qpidd on
+ chkconfig --level 2345 libvirt-qpid on
+ service qpidd start
+ service libvirt-qpid start
+ sed -i.sed s/libvirt/libvirt-qpid/g /etc/fence_virt.conf
+
+Testing the Host
+
+Start the daemon:
+
+ fence_virtd
+
+Then run:
+
+ fence_xvm -o list
+
+You should see output like the following:
+
+ [03:37 PM] root@f12 ~ # fence_xvm -o list
+ pcmk-1               17bd6b6a-928f-2820-64ac-7c8d536df65f on
+ pcmk-2               f0062842-0196-7ec1-7623-e5bbe3a6632c on
+ pcmk-3               33e954b8-39ae-fb4b-e6e8-ecc443516b92 on
+ pcmk-4               98cda6de-74c4-97bf-0cfb-3954ff76a5c3 on
+ Remote: Operation was successful
+
+Configure the Guest
+
+Just install the key:
+
+ scp /etc/cluster/fence_xvm.key pcmk-1:/etc/cluster/fence_xvm.key
+ scp /etc/cluster/fence_xvm.key pcmk-2:/etc/cluster/fence_xvm.key
+ scp /etc/cluster/fence_xvm.key pcmk-3:/etc/cluster/fence_xvm.key
+ scp /etc/cluster/fence_xvm.key pcmk-4:/etc/cluster/fence_xvm.key
+
+Testing the Guest
+
+Run:
+
+ fence_xvm -o list
+
+You should see the same output as you saw on the host, eg:
+
+ [03:47 PM] root@pcmk-12 ~ # fence_xvm -o list
+ pcmk-1               17bd6b6a-928f-2820-64ac-7c8d536df65f on
+ pcmk-2               f0062842-0196-7ec1-7623-e5bbe3a6632c on
+ pcmk-3               33e954b8-39ae-fb4b-e6e8-ecc443516b92 on
+ pcmk-4               98cda6de-74c4-97bf-0cfb-3954ff76a5c3 on
+ Remote: Operation was successful
+
+Configure Fencing Resource in Pacemaker
+
+Now create the resource in Pacemaker:
+
+ crm configure primitive st-virt stonith:fence_xvm
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Fencing in Libvirt/KVM virtualized cluster nodes
+
+    Fencing libvirt Pacemaker 
+
+Often, people deploy the Pacemaker stack in virtual environments for purposes of testing and evaluation. In such environments, it's easy to test Pacemaker's fencing capabilities by tying in with the hypervisor.
+
+This quick howto illustrates how to configure fencing for two virtual cluster nodes hosted on a libvirt/KVM hypervisor host.
+libvirt configuration (hypervisor)
+
+In order to do libvirt fencing, your hypervisor should have its libvirtd daemon listen on a network socket. libvirtd is capable of doing this, both on an encrypted TLS socket, and on a regular, unencrypted TCP port. Needless to say, for production use you should only use TLS, but for testing and evaluation – and for that purpose only – TCP is fine.
+
+In order for your hypervisor to listen on an unauthenticated, insecure, unencrypted network socket (did we mention that's unsuitable for production?), add the following lines to your libvirtd configuration file:
+
+listen_tls = 0
+listen_tcp = 1
+tcp_port = "16509"
+auth_tcp = "none"
+
+You can also set the listen_addr parameter, for example to have libvirtd listen only on the network that your virtual machines run in. If you don't set listen_addr, libvirtd will simply listen on the wildcard address.
+
+You'll also have to add the -l or --listen flag to your libvirtd invocation. On Debian/Ubuntu platforms, you can do so by editing the /etc/default/libvirt-bin configuration file.
+
+Once you've done that, you can use netstat -ltp to check whether libvirtd is in fact listening on its configured port, 16509/tcp. Also, make sure that you don't have a firewall blocking that port.
+libvirt configuration (virtual machines)
+
+Inside your virtual machines, you'll also have to install the libvirt client binaries – the fencing mechanism uses the virsh utility under the covers. Some platforms provide a libvirt-client package for that purpose; for other's, you'll simply have to install the full libvirt package.
+
+Once that is set up, you should be able to run this command from inside your virtual machines:
+
+virsh --connect=qemu+tcp://<IP of your hypervisor>/system \
+  list --all
+
+... and that command should list all the domains running on that host, including the one you're connecting from.
+Pacemaker configuration
+
+In one of your virtual machines, you can now set up your fencing configuration.
+
+This example assumes that you have two nodes named alice and bob, that their corresponding virtual machine domain names are also alice and bob, and that they can reach their hypervisor by TCP at 192.168.0.1:
+
+primitive p_fence_alice stonith:external/libvirt \
+  params hostlist="alice" \
+   hypervisor_uri="qemu+tcp://192.168.0.1/system" \
+  op monitor interval="60"
+primitive p_fence_bob stonith:external/libvirt \
+  params hostlist="bob" \
+    hypervisor_uri="qemu+tcp://192.168.0.1/system" \
+  op monitor interval="60"
+location l_fence_alice p_fence_alice -inf: alice
+location l_fence_bob p_fence_bob -inf: bob
+property stonith-enabled=true
+
+Now you can test fencing to the best of your abilities.
+
+
